@@ -48,9 +48,9 @@ class ReplaceMoreTt(torch.fx.Transformer):
             call_func = super().call_function(ttnn.softmax, args[:2], kwargs)
         elif target == torch.ops.aten.tanh.default:
             call_func = super().call_function(ttnn.tanh, args, kwargs)
-        elif target == torch.ops.aten.view.default:
-            # TODO(kevinwuTT): Handle restrictions from ttnn.reshape
-            call_func = super().call_function(target, args, kwargs)
+        # elif target == torch.ops.aten.view.default:
+        #     # TODO(kevinwuTT): Handle restrictions from ttnn.reshape
+        #     call_func = super().call_function(target, args, kwargs)
         elif target == torch.ops.aten.permute.default:
             call_func = super().call_function(ttnn.permute, args, kwargs)
         elif target == torch.ops.aten.relu.default:
@@ -174,7 +174,10 @@ def ReplaceMoreTtManually(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
                     args=(args[0],),
                     kwargs={"epsilon": args[4], "weight": args[2], "bias": args[3]},
                 )
-                new_node.meta["val"] = node.meta["val"]
+                node_meta = node.meta["val"]
+                new_node.meta["val"] = (
+                    node_meta[0] if isinstance(node_meta, tuple) else node_meta
+                )
                 node.replace_all_uses_with(
                     new_node, delete_user_cb=lambda node: node != new_node
                 )
@@ -405,6 +408,53 @@ def ReplaceMoreTtManually(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
                     new_node,
                     delete_user_cb=lambda node: node != new_node,
                 )
+            if node.target == torch.ops.aten.view.default:
+                source_shape = args[0].meta["val"].size()
+                out_shape = args[1]
+                source_rank = len(source_shape)
+                out_rank = len(out_shape)
+
+                can_reshape = True
+                # Same as ttnn.squeeze with dim = 0
+                # Example:
+                # (1, 16, 256, 256) -> (16, 256, 256)
+                # (1, 256, 256) - > (256, 256)
+                if (
+                    (source_rank != 1)
+                    and (out_rank == (source_rank - 1))
+                    and (source_shape[0] == 1)
+                ):
+                    for i in range(0, out_rank):
+                        if source_shape[i + 1] != out_shape[i]:
+                            can_reshape &= False
+                # Same as ttnn.unsqueeze_to_4D
+                # Example:
+                # (16, 256, 256) -> (1, 16, 256, 256)
+                # (256, 256) -> (1, 1, 256, 256)
+                elif (
+                    (out_rank > 1)
+                    and (out_rank <= 4)
+                    and (source_rank > 0)
+                    and (source_rank <= 4)
+                ):
+                    for i in range(0, out_rank):
+                        si = i + (source_rank - out_rank)
+                        if si < 0:
+                            if out_shape[i] != 1:
+                                can_reshape &= False
+                        else:
+                            if out_shape[i] != source_shape[si]:
+                                can_reshape &= False
+                else:
+                    can_reshape = False
+
+                # Transform to ttnn.reshape if possible
+                if can_reshape:
+                    new_node = g.call_function(ttnn.reshape, (args[0], args[1]), {})
+                    new_node.meta["val"] = node.meta["val"]
+                    node.replace_all_uses_with(
+                        new_node, delete_user_cb=lambda node: node != new_node
+                    )
 
     gm = GraphCleanup(gm)
     return gm

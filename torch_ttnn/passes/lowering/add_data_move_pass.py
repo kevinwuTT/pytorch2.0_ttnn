@@ -5,6 +5,8 @@ from torch_ttnn.utils import (
     DummyTtnnRowMajorLayout,
     DummyTtnnTileLayout,
     DummyDevice,
+    DummyTtlTensorTensorMemoryLayoutInterleaved,
+    DummyTtlTensorBufferTypeDram,
 )
 
 
@@ -177,13 +179,19 @@ def try_add_data_move_in(src_node, dst_idx, dst_node, device) -> torch.fx.node.N
                 g.call_function(ttnn.to_layout, (new_nodes[-1], DummyTtnnTileLayout()))
             )
         # For reshape only put tensor on device if rank is 4
-        if (is_tt_compute(dst_node) and dst_node.target != ttnn.reshape) or (
-            dst_node.target == ttnn.reshape and len(dst_node.args[1]) == 4
-        ):
+        if is_tt_compute(dst_node):
             new_nodes.append(g.call_function(ttnn.to_device, (new_nodes[-1], device)))
 
     insert_node_between(src_node, dst_idx, dst_node, new_nodes)
     return new_nodes[-1]
+
+
+ops_with_layout_change = set(
+    [
+        ttnn.repeat,
+        ttnn.reshape,
+    ]
+)
 
 
 def try_add_layout_change_before_repeat(
@@ -196,13 +204,27 @@ def try_add_layout_change_before_repeat(
         return None
     if not is_function_call(dst_node):
         return None
-    if dst_node.target != ttnn.repeat or dst_idx != 0 or not is_tt(src_node):
+    if (
+        (dst_node.target not in ops_with_layout_change)
+        or dst_idx != 0
+        or not is_tt(src_node)
+    ):
         return None
 
     g = dst_node.graph
     with g.inserting_before(dst_node):
+        memory_config = g.call_function(
+            ttnn.MemoryConfig,
+            (
+                DummyTtlTensorTensorMemoryLayoutInterleaved(),
+                DummyTtlTensorBufferTypeDram(),
+            ),
+        )
+        new_kwargs = {
+            "memory_config": memory_config,
+        }
         to_layout = g.call_function(
-            ttnn.to_layout, (src_node, DummyTtnnRowMajorLayout())
+            ttnn.to_layout, (src_node, DummyTtnnRowMajorLayout()), new_kwargs
         )
 
     insert_node_between(src_node, dst_idx, dst_node, [to_layout])
@@ -216,7 +238,7 @@ def try_add_layout_change_after_repeat(
     # Consider src_node is ttnn.repeat, and dst_node should be any tt_compute node that uses ttnn.repeat
     if not is_function_call(src_node):
         return None
-    if src_node.target != ttnn.repeat or not is_tt_compute(dst_node):
+    if (src_node.target not in ops_with_layout_change) or not is_tt_compute(dst_node):
         return None
 
     g = dst_node.graph
@@ -235,9 +257,7 @@ def try_add_data_move_out(src_node, dst_idx, dst_node) -> torch.fx.node.Node:
     g = dst_node.graph
     new_nodes = list()
     with g.inserting_before(dst_node):
-        if (is_tt_compute(src_node) and src_node.target != ttnn.reshape) or (
-            src_node.target == ttnn.reshape and len(src_node.args[1]) == 4
-        ):
+        if is_tt_compute(src_node) and src_node.target != ttnn.reshape:
             new_nodes.append(g.call_function(ttnn.from_device, (src_node,)))
             if src_node.target != ttnn.embedding and src_node.target != ttnn.zeros_like:
                 new_nodes.append(
